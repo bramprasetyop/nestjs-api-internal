@@ -1,0 +1,269 @@
+image:
+  name: docker/compose:1.25.3
+  entrypoint: ['/bin/sh', '-c']
+
+stages:
+  - test
+  - build
+  - deploy
+  - cleanup-deploy-review
+
+variables:
+  APP_NAME: wahyoo-pos-api-public
+  REGION_NAME: asia-southeast1
+  LOG_BUILD_BUCKET: wahyoo-cloud-build-logs
+  SERVICE_ACCOUNT_NAME: wahyoo-pos-api-public-sa
+  VPC_CONNECTOR_NAME_PREFIX: wahconn1
+  MEMORY_SIZE: 1Gi
+  CPU_LIMIT: 1
+  # TOPIC_PUBSUB_PREFIX: review-40
+
+
+services:
+  - docker:18.09.7-dind
+
+
+### TEMPLATE ###
+.template: &tpl-changed-files
+  changes:
+    - .gitlab-ci.yml
+    - src/**/*
+    - modules/**/*
+
+.template: &tpl-unit-test
+  image: node:10.16.3
+  stage: test
+  tags:
+    - gitlab-autoscale-runner
+  allow_failure: false
+  when: manual
+  only:
+    refs:
+      - merge_requests
+  script:
+    - yarn install
+    - yarn run unit-test
+
+
+.template: &tpl-build-publish-image
+  image: google/cloud-sdk:357.0.0-slim
+  stage: build
+  tags:
+    - gitlab-autoscale-runner
+  allow_failure: false
+  when: on_success
+  script:
+    - echo $NODE_ENV
+    - cat $DOCUSIGN_PRIVATE_KEY > ./docusign.private.key
+    - echo $PUBSUB_SERVICE_KEY > ./wahyoo-pubsub.json
+    - cp $GCLOUD_SERVICE_KEY ./gcp-credentials.json
+    - echo $FIREBASE_SERVICE_KEY > ./wahyoo-firebase-adminsdk.json
+    - gcloud auth activate-service-account --key-file $GCLOUD_SERVICE_KEY
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud builds submit -t asia.gcr.io/$GCP_PROJECT_ID/$APP_NAME:$(echo $CI_COMMIT_SHA | cut -c1-8) --gcs-log-dir=gs://$LOG_BUILD_BUCKET
+
+.template: &tpl-deploy
+  image: google/cloud-sdk:357.0.0-slim
+  stage: deploy
+  tags:
+    - gitlab-autoscale-runner
+  when: on_success
+  before_script:
+    # - export NOTIFICATION_SERVICE_ENDPOINT=
+    # - export INTERNAL_API_ENDPOINT=
+    # - export RABBITMQ_PREFIX=
+  script:
+    - gcloud auth activate-service-account --key-file $GCLOUD_SERVICE_KEY
+    # create service account if not exist yet, this will be used as service account for the cloud run
+    - gcloud iam service-accounts create $SERVICE_ACCOUNT_NAME --description $SERVICE_ACCOUNT_NAME --display-name $SERVICE_ACCOUNT_NAME --project $GCP_PROJECT_ID || true
+    - echo https://console.cloud.google.com/run/detail/$REGION_NAME/$APP_NAME-$CI_MERGE_REQUEST_IID/logs?project=$GCP_PROJECT_ID
+    - gcloud run deploy $INSTANCE_NAME
+      --image asia.gcr.io/$GCP_PROJECT_ID/$APP_NAME:$(echo $CI_COMMIT_SHA | cut -c1-8)
+      --vpc-connector $VPC_CONNECTOR_NAME_PREFIX-$NODE_ENV
+      --region $REGION_NAME
+      --service-account $SERVICE_ACCOUNT_NAME
+      --allow-unauthenticated
+      --platform managed
+      --memory $MEMORY_SIZE
+      --cpu $CPU_LIMIT
+      --project $GCP_PROJECT_ID
+      --set-env-vars NODE_ENV=$NODE_ENV,\
+      DB_PORT_STAGING=$DB_PORT_STAGING,\
+      DB_USERNAME_STAGING=$DB_USERNAME_STAGING,\
+      DB_PASSWORD_STAGING=$DB_PASSWORD_STAGING,\
+      DB_DATABASE_STAGING=$DB_DATABASE_STAGING,\
+      DB_HOST_STAGING=$DB_HOST_STAGING,\
+      DB_PORT_PRODUCTION=$DB_PORT_PRODUCTION,\
+      DB_USERNAME_PRODUCTION=$DB_USERNAME_PRODUCTION,\
+      DB_PASSWORD_PRODUCTION=$DB_PASSWORD_PRODUCTION,\
+      DB_DATABASE_PRODUCTION=$DB_DATABASE_PRODUCTION,\
+      DB_HOST_PRODUCTION=$DB_HOST_PRODUCTION,\
+      INTERNAL_API_ENDPOINT=$INTERNAL_API_ENDPOINT,\
+      INTERNAL_API_SECRET_KEY=$INTERNAL_API_SECRET_KEY,\
+      INTERNAL_API_USER_ID=$INTERNAL_API_USER_ID,\
+      GOOGLE_APPLICATION_PUBSUB_CREDENTIALS=$GOOGLE_APPLICATION_PUBSUB_CREDENTIALS,\
+      CI_ENVIRONMENT_SLUG=$CI_ENVIRONMENT_SLUG,\
+      CI_MERGE_REQUEST_IID=$CI_MERGE_REQUEST_IID,\
+      TOPIC_PUBSUB_PREFIX=$TOPIC_PUBSUB_PREFIX,\
+      ORDER_SERVICE_BASE_URL=$ORDER_SERVICE_BASE_URL,\
+      GOOGLE_CLOUD_STORAGE_BUCKET_PRIVATE=$GOOGLE_CLOUD_STORAGE_BUCKET_PRIVATE,\
+      GOOGLE_CLOUD_STORAGE_BUCKET_PUBLIC=$GOOGLE_CLOUD_STORAGE_BUCKET_PUBLIC,\
+      MAILGUN_API_KEY=$MAILGUN_API_KEY,\
+      MAILGUN_DOMAIN=$MAILGUN_DOMAIN,\
+      GCP_PROJECT_ID=$GCP_PROJECT_ID,\
+      GOOGLE_APPLICATION_CREDENTIALS=$GOOGLE_APPLICATION_CREDENTIALS,\
+      RABBITMQ_CONNECTION_URL=$RABBITMQ_CONNECTION_URL,\
+      REDIS_ENDPOINT=$REDIS_ENDPOINT,\
+      REDIS_PASSWORD=$REDIS_PASSWORD,\
+      KATA_AI_BASE_URL=$KATA_AI_BASE_URL,\
+      KATA_AI_WAHYOO_USER_NAME=$KATA_AI_WAHYOO_USER_NAME,\
+      KATA_AI_WAHYOO_PASSWORD=$KATA_AI_WAHYOO_PASSWORD,\
+      KATA_AI_WAHYOO_NAMESPACE=$KATA_AI_WAHYOO_NAMESPACE,\
+      WAVE_CELL_SENDER_NAME=$WAVE_CELL_SENDER_NAME,\
+      WAVE_CELL_URL=$WAVE_CELL_URL,\
+      WAVE_CELL_API_KEY=$WAVE_CELL_API_KEY,\
+      CIT_CALL_API_KEY=$CIT_CALL_API_KEY,\
+      CIT_CALL_URL=$CIT_CALL_URL,\
+      JWT_SESSION_SECRET=$JWT_SESSION_SECRET,\
+      JWT_SESSION_EXPIRY=$JWT_SESSION_EXPIRY,\
+      OTP_EXPIRY_IN_MINUTE=$OTP_EXPIRY_IN_MINUTE,\
+      WHITELIST_PHONE_NUMBER_PUBLIC=$WHITELIST_PHONE_NUMBER_PUBLIC,\
+      WHITELIST_PHONE_NUMBER_VERIFICATION_CODE_PUBLIC=$WHITELIST_PHONE_NUMBER_VERIFICATION_CODE_PUBLIC,\
+      NOTIFICATION_SERVICE_ENDPOINT=$NOTIFICATION_SERVICE_ENDPOINT,\
+      NOTIFICATION_SERVICE_APP_ID_POS=$NOTIFICATION_SERVICE_APP_ID_POS,\
+      NOTIFICATION_SERVICE_WEB_ID_POS=$NOTIFICATION_SERVICE_WEB_ID_POS,\
+      NOTIFICATION_SERVICE_SECRET_KEY=$NOTIFICATION_SERVICE_SECRET_KEY,\
+      APPLICATION_NAME=$APPLICATION_NAME,\
+      DOCUSIGN_SECRET_KEY=$DOCUSIGN_SECRET_KEY,\
+      HUBSTER_BASE_URL=$HUBSTER_BASE_URL,\
+      HUBSTER_CLIENT_ID=$HUBSTER_CLIENT_ID,\
+      HUBSTER_CLIENT_SECRET=$HUBSTER_CLIENT_SECRET,\
+      DOCUSIGN_CLIENT_ID=$DOCUSIGN_CLIENT_ID,\
+      DOCUSIGN_ACCOUNT_ID=$DOCUSIGN_ACCOUNT_ID,\
+      DOCUSIGN_USER_ID=$DOCUSIGN_USER_ID,\
+      DOCUSIGN_BASE_URL=$DOCUSIGN_BASE_URL,\
+      DOCUSIGN_OAUTH_BASE_URL=$DOCUSIGN_OAUTH_BASE_URL,\
+      DOCUSIGN_DEFAULT_CC_EMAIL=$DOCUSIGN_DEFAULT_CC_EMAIL,\
+      "DOCUSIGN_DEFAULT_CC_NAME=$DOCUSIGN_DEFAULT_CC_NAME",\
+      RABBITMQ_PREFIX=$RABBITMQ_PREFIX,\
+      SERVICE_NAME=$SERVICE_NAME
+    - REVIEW_URL=$(gcloud run services describe $INSTANCE_NAME
+      --platform managed
+      --project $GCP_PROJECT_ID
+      --region $REGION_NAME | grep 'https' | head -1 | tr ' ' '\n' | grep https)
+    - echo $REVIEW_URL
+    - ./.gitlab/scripts/comment_review_link.sh $INSTANCE_NAME $REVIEW_URL
+
+### END OF TEMPLATE ###
+
+
+### STAGE TEST ###
+
+# public-v1:unit-test:
+#   <<: *tpl-unit-test
+
+### END OF STAGE TEST ###
+
+
+
+### STAGE BUILD ###
+build-publish-image:review:
+  <<: *tpl-build-publish-image
+  environment:
+    name: review/$APP_NAME-$CI_MERGE_REQUEST_IID
+  when: manual # remove this when unit test is enabled
+  only:
+    refs:
+      - merge_requests
+    <<: *tpl-changed-files
+
+build-publish-image:staging:
+  <<: *tpl-build-publish-image
+  environment:
+    name: staging
+  only:
+    refs:
+      - master
+    <<: *tpl-changed-files
+
+build-publish-image:production:
+  <<: *tpl-build-publish-image
+  environment:
+    name: production
+  variables:
+    LOG_BUILD_BUCKET: wahyoo-cloud-build-prod-logs    
+  only:
+    refs:
+      - production
+    <<: *tpl-changed-files
+
+### END OF STAGE BUILD ###
+
+
+### STAGE DEPLOY ###
+deploy:review:
+  <<: *tpl-deploy
+  needs: ["build-publish-image:review"]
+  only:
+    refs:
+      - merge_requests
+  environment:
+    name: review/$APP_NAME-$CI_MERGE_REQUEST_IID
+    on_stop: stop:review
+    auto_stop_in: 2 days
+  variables:
+    INSTANCE_NAME: $APP_NAME-$CI_MERGE_REQUEST_IID
+
+deploy:staging:
+  <<: *tpl-deploy
+  needs: ["build-publish-image:staging"]
+  only:
+    refs:
+      - master
+  environment:
+    name: staging
+  variables:
+    INSTANCE_NAME: $APP_NAME-$NODE_ENV
+
+deploy:production:
+  <<: *tpl-deploy
+  needs: ["build-publish-image:production"]
+  only:
+    refs:
+      - production
+  environment:
+    name: production
+  variables:
+    INSTANCE_NAME: $APP_NAME-$NODE_ENV
+
+### END OF STAGE DEPLOY ###
+
+
+### STAGE CLEANUP DEPLOY REVIEW ###
+
+stop:review:
+  image: google/cloud-sdk:357.0.0-slim
+  variables:
+    GIT_STRATEGY: none
+  stage: cleanup-deploy-review
+  tags:
+    - gitlab-autoscale-runner
+  when: manual
+  only:
+    refs:
+      - merge_requests
+  environment:
+    name: review/$APP_NAME-$CI_MERGE_REQUEST_IID
+    action: stop
+  variables:
+    INSTANCE_NAME: $APP_NAME-$CI_MERGE_REQUEST_IID
+  script:
+    - gcloud auth activate-service-account --key-file $GCLOUD_SERVICE_KEY
+    - gcloud run services delete $INSTANCE_NAME
+      --platform managed
+      --project $GCP_PROJECT_ID
+      --region $REGION_NAME
+      --quiet
+
+
+### END OF STAGE CLEANUP DEPLOY REVIEW ###

@@ -1,0 +1,242 @@
+# description of workflow
+name: Deploy Pull Request Manual
+
+# will cancel prev action with same workflow and github ref 
+# example github.ref: refs/heads/<branch_name> | refs/pull/<pr_number>/merge | refs/tags/<tag_name>
+concurrency: 
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+  
+env:
+  NODE_ENV: staging
+  APP_NAME: wahyoo-pos-api-internal
+  SERVICE_NAME: wahyoo-pos-api-internal
+  INSTANCE_NAME: wahyoo-pos-api-internal
+  REGION_NAME: asia-southeast1
+  LOG_BUILD_BUCKET: wahyoo-cloud-build-logs
+  SERVICE_ACCOUNT_NAME: wahyoo-pos-api-internal-sa
+  VPC_CONNECTOR_NAME_PREFIX: wahconn1
+  MEMORY_SIZE: 1Gi
+  CPU_LIMIT: 1
+  GCLOUD_SERVICE_KEY: ${{secrets.GCLOUD_SERVICE_KEY_STAGING}}
+  GCP_PROJECT_ID: wahyoo-staging
+  ENV_BUCKET_PATH: wahyoo-secrets/wahyoo-pos-api-internal
+  GCP_CREDENTIAL_FILE_NAME: gcp-credentials.json
+
+
+on: workflow_dispatch
+
+
+jobs:
+  # description of job prepare
+  prepare:
+    if: github.ref_name != 'master' && github.ref_name != 'production'
+    name: Prepare
+    runs-on: self-hosted
+    steps:
+      - name: Get Pull Request Number
+        uses: jwalton/gh-find-current-pr@v1
+        id: find_pr_step
+        with:
+          # state options: open|closed|all.
+          state: open
+      - name: Validate and Generate Output
+        if: success() && steps.find_pr_step.outputs.number
+        id: pr_valid_step
+        run: |
+          echo "horeey!, this branch has PR, continue to next jobs"
+          echo "::set-output name=number::${{steps.find_pr_step.outputs.number}}"
+    # declare outputs of job 'prepare'
+    outputs:
+      pr_number: ${{ steps.pr_valid_step.outputs.number }}
+  # description of job test
+  test:
+    if: github.ref_name != 'master' && github.ref_name != 'production'
+    name: Test
+    needs: [prepare]
+    runs-on: self-hosted
+    steps:
+      - name: Test
+        run: |
+          echo "${{ needs.prepare.outputs.pr_number }}"
+
+  # description of job build
+  build:
+    if: github.ref_name != 'master' && github.ref_name != 'production' && needs.prepare.outputs.pr_number
+    name: Build Image
+    needs: [prepare, test]
+    runs-on: self-hosted
+    container: google/cloud-sdk:357.0.0-slim
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 14
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@wahyoo"
+      - name: Create .npmrc file
+        run: |
+          cat <<EOF > .npmrc
+            //npm.pkg.github.com/:_authToken=${{ secrets.GH_TOKEN }}
+            @wahyoo:registry=https://npm.pkg.github.com
+            always-auth=true
+          EOF
+
+          echo "cat .npmrc"
+          cat .npmrc
+      - name: Download env file and other keys
+        shell: bash
+        run: |
+          echo "$GCLOUD_SERVICE_KEY" > $GCP_CREDENTIAL_FILE_NAME
+          gcloud auth activate-service-account --key-file $GCP_CREDENTIAL_FILE_NAME
+          gcloud config set project $GCP_PROJECT_ID
+          gsutil cp gs://$ENV_BUCKET_PATH/env-staging .
+          gsutil cp gs://$ENV_BUCKET_PATH/docusign.private.key .
+          gsutil cp gs://$ENV_BUCKET_PATH/wahyoo-pubsub.json .
+          gsutil cp gs://$ENV_BUCKET_PATH/wahyoo-firebase-adminsdk.json .
+      - name: Update $GITHUB_ENV from file
+        uses: cardinalby/export-env-action@v2
+        with:
+          envFile: 'env-staging'    
+          expand: 'true'
+      - name: Print ENV
+        run: echo "${{env.NODE_ENV}}"
+      - name: Build Image and Push to GCR
+        run: |
+          gcloud builds submit -t asia.gcr.io/$GCP_PROJECT_ID/$APP_NAME:$(echo ${{ github.sha }} | cut -c1-8) --gcs-log-dir=gs://$LOG_BUILD_BUCKET
+  # description of job deploy
+  deploy:
+    if: github.ref_name != 'master' && github.ref_name != 'production'
+    name: Deploy
+    needs: [prepare, build]
+    runs-on: self-hosted
+    container: google/cloud-sdk:357.0.0-slim
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 14
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@wahyoo"
+      - name: Create .npmrc file
+        run: |
+          cat <<EOF > .npmrc
+            //npm.pkg.github.com/:_authToken=${{ secrets.GH_TOKEN }}
+            @wahyoo:registry=https://npm.pkg.github.com
+            always-auth=true
+          EOF
+
+          echo "cat .npmrc"
+          cat .npmrc
+      - name: Download env file and other keys
+        shell: bash
+        run: |
+          echo "$GCLOUD_SERVICE_KEY" > $GCP_CREDENTIAL_FILE_NAME
+          gcloud auth activate-service-account --key-file $GCP_CREDENTIAL_FILE_NAME
+          gcloud config set project $GCP_PROJECT_ID
+          gsutil cp gs://$ENV_BUCKET_PATH/env-staging .
+      - name: Update $GITHUB_ENV from file
+        uses: cardinalby/export-env-action@v2
+        with:
+          envFile: 'env-staging'    
+          expand: 'true'
+      - name: Print ENV
+        run: echo "${{env.NODE_ENV}}"
+      - name: Deploy to GCP Cloud Run
+        id: deploy_cloud_run_step
+        env:
+          # TODO:should remove depency on this variable on souce code
+          CI_MERGE_REQUEST_IID: ${{ needs.prepare.outputs.pr_number }}
+          # instance of CLoud Run should have PR Number
+          INSTANCE_NAME: ${{env.APP_NAME}}-${{ needs.prepare.outputs.pr_number }}
+        run: |
+          gcloud iam service-accounts create $SERVICE_ACCOUNT_NAME --description $SERVICE_ACCOUNT_NAME --display-name $SERVICE_ACCOUNT_NAME --project $GCP_PROJECT_ID || true
+          gcloud run deploy $INSTANCE_NAME \
+          --image asia.gcr.io/$GCP_PROJECT_ID/$APP_NAME:$(echo ${{ github.sha }} | cut -c1-8) \
+          --region $REGION_NAME \
+          --service-account $SERVICE_ACCOUNT_NAME \
+          --allow-unauthenticated \
+          --platform managed \
+          --memory $MEMORY_SIZE \
+          --cpu $CPU_LIMIT \
+          --project $GCP_PROJECT_ID \
+          --set-env-vars NODE_ENV=$NODE_ENV,\
+          DB_PORT_STAGING=$DB_PORT_STAGING,\
+          DB_USERNAME_STAGING=$DB_USERNAME_STAGING,\
+          DB_PASSWORD_STAGING=$DB_PASSWORD_STAGING,\
+          DB_DATABASE_STAGING=$DB_DATABASE_STAGING,\
+          DB_HOST_STAGING=$DB_HOST_STAGING,\
+          DB_PORT_PRODUCTION=$DB_PORT_PRODUCTION,\
+          DB_USERNAME_PRODUCTION=$DB_USERNAME_PRODUCTION,\
+          DB_PASSWORD_PRODUCTION=$DB_PASSWORD_PRODUCTION,\
+          DB_DATABASE_PRODUCTION=$DB_DATABASE_PRODUCTION,\
+          DB_HOST_PRODUCTION=$DB_HOST_PRODUCTION,\
+          INTERNAL_API_ENDPOINT=$INTERNAL_API_ENDPOINT,\
+          INTERNAL_API_SECRET_KEY=$INTERNAL_API_SECRET_KEY,\
+          INTERNAL_API_USER_ID=$INTERNAL_API_USER_ID,\
+          GOOGLE_APPLICATION_PUBSUB_CREDENTIALS=$GOOGLE_APPLICATION_PUBSUB_CREDENTIALS,\
+          CI_ENVIRONMENT_SLUG=$CI_ENVIRONMENT_SLUG,\
+          CI_MERGE_REQUEST_IID=$CI_MERGE_REQUEST_IID,\
+          TOPIC_PUBSUB_PREFIX=$TOPIC_PUBSUB_PREFIX,\
+          ORDER_SERVICE_BASE_URL=$ORDER_SERVICE_BASE_URL,\
+          GOOGLE_CLOUD_STORAGE_BUCKET_PRIVATE=$GOOGLE_CLOUD_STORAGE_BUCKET_PRIVATE,\
+          GOOGLE_CLOUD_STORAGE_BUCKET_PUBLIC=$GOOGLE_CLOUD_STORAGE_BUCKET_PUBLIC,\
+          MAILGUN_API_KEY=$MAILGUN_API_KEY,\
+          MAILGUN_DOMAIN=$MAILGUN_DOMAIN,\
+          GCP_PROJECT_ID=$GCP_PROJECT_ID,\
+          GOOGLE_APPLICATION_CREDENTIALS=$GOOGLE_APPLICATION_CREDENTIALS,\
+          RABBITMQ_CONNECTION_URL=$RABBITMQ_CONNECTION_URL,\
+          REDIS_ENDPOINT=$REDIS_ENDPOINT,\
+          REDIS_PASSWORD=$REDIS_PASSWORD,\
+          KATA_AI_BASE_URL=$KATA_AI_BASE_URL,\
+          KATA_AI_WAHYOO_USER_NAME=$KATA_AI_WAHYOO_USER_NAME,\
+          KATA_AI_WAHYOO_PASSWORD=$KATA_AI_WAHYOO_PASSWORD,\
+          KATA_AI_WAHYOO_NAMESPACE=$KATA_AI_WAHYOO_NAMESPACE,\
+          WAVE_CELL_SENDER_NAME=$WAVE_CELL_SENDER_NAME,\
+          WAVE_CELL_URL=$WAVE_CELL_URL,\
+          WAVE_CELL_API_KEY=$WAVE_CELL_API_KEY,\
+          CIT_CALL_API_KEY=$CIT_CALL_API_KEY,\
+          CIT_CALL_URL=$CIT_CALL_URL,\
+          JWT_SESSION_SECRET=$JWT_SESSION_SECRET,\
+          JWT_SESSION_EXPIRY=$JWT_SESSION_EXPIRY,\
+          OTP_EXPIRY_IN_MINUTE=$OTP_EXPIRY_IN_MINUTE,\
+          WHITELIST_PHONE_NUMBER_PUBLIC=$WHITELIST_PHONE_NUMBER_PUBLIC,\
+          WHITELIST_PHONE_NUMBER_VERIFICATION_CODE_PUBLIC=$WHITELIST_PHONE_NUMBER_VERIFICATION_CODE_PUBLIC,\
+          NOTIFICATION_SERVICE_ENDPOINT=$NOTIFICATION_SERVICE_ENDPOINT,\
+          NOTIFICATION_SERVICE_APP_ID_POS=$NOTIFICATION_SERVICE_APP_ID_POS,\
+          NOTIFICATION_SERVICE_WEB_ID_POS=$NOTIFICATION_SERVICE_WEB_ID_POS,\
+          NOTIFICATION_SERVICE_SECRET_KEY=$NOTIFICATION_SERVICE_SECRET_KEY,\
+          APPLICATION_NAME=$APPLICATION_NAME,\
+          DOCUSIGN_SECRET_KEY=$DOCUSIGN_SECRET_KEY,\
+          HUBSTER_BASE_URL=$HUBSTER_BASE_URL,\
+          HUBSTER_CLIENT_ID=$HUBSTER_CLIENT_ID,\
+          HUBSTER_CLIENT_SECRET=$HUBSTER_CLIENT_SECRET,\
+          DOCUSIGN_CLIENT_ID=$DOCUSIGN_CLIENT_ID,\
+          DOCUSIGN_ACCOUNT_ID=$DOCUSIGN_ACCOUNT_ID,\
+          DOCUSIGN_USER_ID=$DOCUSIGN_USER_ID,\
+          DOCUSIGN_BASE_URL=$DOCUSIGN_BASE_URL,\
+          DOCUSIGN_OAUTH_BASE_URL=$DOCUSIGN_OAUTH_BASE_URL,\
+          DOCUSIGN_DEFAULT_CC_EMAIL=$DOCUSIGN_DEFAULT_CC_EMAIL,\
+          "DOCUSIGN_DEFAULT_CC_NAME=$DOCUSIGN_DEFAULT_CC_NAME",\
+          RABBITMQ_PREFIX=$RABBITMQ_PREFIX,\
+          SERVICE_NAME=$SERVICE_NAME
+
+          export REVIEW_URL=$(gcloud run services describe $INSTANCE_NAME \
+          --platform managed \
+          --project $GCP_PROJECT_ID \
+          --region $REGION_NAME | grep 'https' | head -1 | tr ' ' '\n' | grep https)
+
+          # create output
+          echo "::set-output name=cloud_run_url::$REVIEW_URL"
+      - name: Create comment on Pull Request
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          recreate: true
+          number: ${{ needs.prepare.outputs.pr_number }}
+          header: review
+          message:  |
+           API Endpoint : ${{ steps.deploy_cloud_run_step.outputs.cloud_run_url }}/graphql

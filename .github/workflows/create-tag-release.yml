@@ -1,0 +1,43 @@
+name: Create tag and release production
+
+concurrency: 
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+  
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  
+on:
+  push:
+    branches: [production]
+
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+    - uses: actions/checkout@v2
+    - name: Create Tag
+      id: create_tag
+      uses: jaywcjlove/create-tag-action@main
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Generate changelog
+      if: steps.create_tag.outputs.successful
+      id: changelog
+      uses: jaywcjlove/changelog-generator@main
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        filter-author: (jaywcjlove|小弟调调™|dependabot|renovate\\[bot\\]|dependabot\\[bot\\]|Renovate Bot)
+        filter: '[R|r]elease[d]\s+[v|V]\d(\.\d+){0,2}'    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      with:
+        tag_name: ${{ steps.create_tag.outputs.version }}
+        release_name: Release ${{ steps.create_tag.outputs.version}}
+        body: |
+          ${{github.event.repository.name}} ${{ steps.create_tag.outputs.version }}
+          
+          changelogs:
+          ${{steps.changelog.outputs.changelog}}

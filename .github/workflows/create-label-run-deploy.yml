@@ -1,0 +1,62 @@
+
+# description of workflow
+name: Create Label Run Deploy
+
+on:
+  issue_comment:
+    types: [created]
+
+
+jobs:
+  # description of job trigger_action
+  trigger_action:
+    name: Trigger Action
+    runs-on: self-hosted
+    steps:
+      - name: Check Action
+        uses: khan/pull-request-comment-trigger@v1.1.0
+        id: check
+        with:
+          trigger: '/deploy'
+          reaction: rocket
+        env:
+          GITHUB_TOKEN: '${{ secrets.GH_TOKEN }}'
+      - run: |
+          echo "Found it!"
+          echo $PR_NUMBER
+        if: steps.check.outputs.triggered == 'true'
+    # declare outputs of job 'trigger_action'
+    outputs:
+      is_action_deploy: ${{ steps.check.outputs.triggered }}
+        
+  # description of job trigger_label
+  trigger_label:
+    if: needs.trigger_action.outputs.is_action_deploy == 'true'
+    name: Build Image
+    needs: [trigger_action]
+    runs-on: self-hosted
+    steps: 
+      - name: Remove Label Run Deploy
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'run deploy'
+              })
+            } catch(err){}
+      - name: Add Label Run Deploy and Dispatch Event labeled
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['run deploy']
+            })

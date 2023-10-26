@@ -1,0 +1,27 @@
+# description of workflow
+name: Comment Create PR
+
+env:
+  MD_MESSAGE: |
+    ## Thank you for opening this PR :pray:
+    ### How to Deploy on This Pull Request:
+    - just typing comment `/deploy`
+    - wait a few minutes when it's done, the result or endpoint url will be shown on comment
+
+on:
+  pull_request:
+    types: [opened]
+    
+jobs:
+  thank-user:
+    runs-on: self-hosted
+    name: Say thanks for the PR
+    steps:
+      - name: comment on the pull request
+        uses: hasura/comment-progress@v2.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{github.repository}}
+          number: ${{ github.event.number }}
+          id: thank-you-comment
+          message: ${{ env.MD_MESSAGE }}

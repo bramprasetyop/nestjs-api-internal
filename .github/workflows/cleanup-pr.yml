@@ -1,0 +1,36 @@
+name: Clean up Pull Request
+
+env:
+  APP_NAME: wahyoo-pos-api-internal
+  INSTANCE_NAME: wahyoo-pos-api-internal
+  REGION_NAME: asia-southeast1
+  GCLOUD_SERVICE_KEY: ${{secrets.GCLOUD_SERVICE_KEY_STAGING}}
+  GCP_PROJECT_ID: wahyoo-staging
+  GCP_CREDENTIAL_FILE_NAME: gcp-credentials.json
+
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - master
+
+jobs:
+  remove_instance:
+    if: github.event.action == 'closed'
+    runs-on: self-hosted
+    container: google/cloud-sdk:357.0.0-slim
+    steps:
+      - name: Remove Instance from Cloud Run
+        shell: bash
+        env:
+          INSTANCE_NAME: ${{env.APP_NAME}}-${{ github.event.number }}
+        run: |
+          echo "$GCLOUD_SERVICE_KEY" > $GCP_CREDENTIAL_FILE_NAME
+          gcloud auth activate-service-account --key-file $GCP_CREDENTIAL_FILE_NAME
+          gcloud config set project $GCP_PROJECT_ID
+          gcloud run services delete $INSTANCE_NAME \
+          --platform managed \
+          --project $GCP_PROJECT_ID \
+          --region $REGION_NAME \
+          --quiet
